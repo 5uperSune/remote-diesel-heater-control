@@ -2669,3 +2669,86 @@ Kode / Output / Referencer
 3. Tilføj HTTP_USER/HTTP_PASSWORD til config.py på ESP32
 4. Test watchdog under normal drift
 5. Medbring optocoupler til næste fysisk session
+
+________________________________________
+Engineering Log – 2026-02-18 (tillæg)
+
+Titel: Root cause analyse - to ødelagte fjernbetjeninger
+
+Kontekst
+Efter sikkerhedsrettelserne blev det klart at TX-pin-fejlen i uart_sniffer.py sandsynligvis var årsagen til at to fjernbetjeninger er blevet beskadiget under udviklingen.
+
+Observationer
+
+To fjernbetjeninger udviser samme symptom:
+- Virker kortvarigt efter tilslutning
+- Fyret slukker efter kort tid
+- Display viser "- - -" (ingen kontakt)
+- En tredje (ubrugt) fjernbetjening virker normalt
+
+Begge defekte remotes har været tilsluttet mens ESP32 snifferen kørte med TX-pin aktiv.
+
+Root Cause Analyse
+
+**Årsag: GPIO17 (TX) konfigureret som aktiv UART output på single-wire COM-bus**
+
+Før rettelsen initialiserede `uart_sniffer.py` UART2 med:
+```python
+UART(2, baudrate=self.baud, rx=PIN_RX, tx=PIN_TX)  # TX=GPIO17 AKTIV!
+```
+
+Dette skabte **bus contention** på single-wire COM-linjen:
+
+```
+Remote output driver → forsøger at drive 4.8V
+ESP32 GPIO17 (TX)    → driver 3.3V (idle) eller 0V (data)
+                       ↓
+              STRØMKONFLIKT PÅ COM-LINJEN
+```
+
+**Skademekanisme:**
+1. UART TX idle state er HIGH (3.3V fra ESP32)
+2. Remotens output-driver forsøger at sende 4.8V signaler
+3. Spændingsforskellen skaber baglæns strøm gennem remotens driver-chip
+4. Gentagen overbelastning brænder output-driveren progressivt af
+5. Remoten kan stadig fungere kortvarigt men mister evnen til stabil kommunikation
+
+**Hvorfor skaden er progressiv:**
+- Første tilslutning: virker tilsyneladende normalt
+- Gentagne sessioner: output-driveren svækkes
+- Slutresultat: remoten kan kun opretholde kommunikation kort tid før signalet er for svagt
+
+**Bekræftende evidens:**
+- To remotes der begge har været udsat for ESP32 TX → begge defekte med identisk symptom
+- Tredje remote der aldrig har været tilsluttet med ESP32 → virker perfekt
+- Fejlen forsvandt ikke ved at skifte baud rate eller ændre software → hardware-skade
+
+Konsekvens / Læring
+
+1. **En TX-pin på en single-wire bus er destruktiv**: Selv idle-tilstanden (3.3V HIGH) skaber spændingskonflikt mod 4.8V bussen. Det er ikke nok at "ikke sende data" - UART TX driver altid linjen.
+
+2. **Bus contention kan ødelægge hardware permanent**: Output-drivere i billige remotes har ingen beskyttelse mod vedvarende spændingskonflikt. Skaden er kumulativ og irreversibel.
+
+3. **Sniffere skal ALTID være passive**: `tx=-1` er ikke en optimering - det er en sikkerhedsforanstaltning. En sniffer der driver linjen er per definition ikke en sniffer.
+
+4. **Test med udstyr du har råd til at miste**: Under reverse engineering bør man bruge billigt/overflødigt udstyr indtil forbindelsen er verificeret sikker.
+
+Økonomi
+
+| Post | Antal | Status |
+|------|-------|--------|
+| Ødelagte remotes | 2 stk | Permanent beskadiget |
+| Ny remote bestilt | 1 stk | Undervejs |
+| Reserve remote (fungerende) | 1 stk | I drift |
+
+Rettelse implementeret
+
+```python
+# FØR (destruktiv):
+self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=PIN_TX)
+
+# EFTER (passiv):
+self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=-1)
+```
+
+Yderligere beskyttelse planlagt med optocoupler (galvanisk isolation) så ESP32 fysisk ikke kan påvirke COM-linjen.
