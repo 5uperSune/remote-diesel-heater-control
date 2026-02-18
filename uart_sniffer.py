@@ -14,13 +14,13 @@ from machine import UART
 import time
 import gc
 
-# UART2 pin configuration
+# UART2 pin configuration (RX only - never drive the COM line!)
 PIN_RX = 16
-PIN_TX = 17
 
 # Default settings
 DEFAULT_BAUD = 2400
 CAPTURE_DURATION_MS = 5000  # 5 seconds capture
+MAX_CAPTURES = 20  # Prevent memory exhaustion
 
 
 class UartSniffer:
@@ -53,8 +53,8 @@ class UartSniffer:
         time.sleep_ms(100)
 
         try:
-            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=PIN_TX)
-            self.uart.init(self.baud, bits=8, parity=None, stop=1)
+            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=-1)
+            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=-1)
         except Exception as e:
             print("UART init error:", e)
             return {"label": label, "data": b"", "baud": self.baud, "bytes": 0}
@@ -91,6 +91,9 @@ class UartSniffer:
             "bytes": len(all_data)
         }
 
+        if len(self.captured_commands) >= MAX_CAPTURES:
+            self.captured_commands.pop(0)
+            print("Max captures reached, oldest removed")
         self.captured_commands.append(result)
         print("Captured {} bytes for '{}'".format(len(all_data), label))
 

@@ -2549,3 +2549,123 @@ ESP32 GND ────────────→ Optocoupler Emitter
 ```
 
 ________________________________________
+Engineering Log – 2026-02-18
+
+Titel: Kritiker-agent og sikkerhedsrettelser baseret på kritisk review
+
+Kontekst
+Hjemmearbejde efter fysisk session på båden. Projektet var i proof-of-concept-stadie med flere kendte mangler. Formålet var at hæve kodekvaliteten fra prototype til noget der kan bygges videre på.
+
+Mål for sessionen
+• Bygge en "kritiker-agent" der systematisk finder problemer i projektet
+• Rette de åbenlyse software-mangler identificeret af kritikeren
+• Sætte GitHub op og committe alt
+
+Setup / Forudsætninger
+• Lokal kode på laptop (ikke på ESP32 - ingen hardware tilsluttet)
+• Claude Code som udviklings-AI
+• GitHub repo: https://github.com/5uperSune/remote-diesel-heater-control
+
+Observationer
+
+**1. Kritiker-agent udviklet**
+
+Byggede en prototype af en "djævlens advokat" agent bestående af:
+- `critic.md` - Prompt-definition med fire reviewer-roller (hardware-skeptiker, sikkerhedsreviewer, arkitektur-kritiker, pålidelighedsingeniør)
+- `run_critic.py` - Script der samler al projektkode og genererer input til review
+
+Kritikeren fandt 28 issues: 7 kritiske, 13 advarsler, 8 bemærkninger.
+
+**2. Rettelser implementeret**
+
+| # | Fix | Fil | Alvorlighed |
+|---|-----|-----|-------------|
+| 1 | TX pin fjernet fra sniffer (`tx=-1`) | `uart_sniffer.py` | KRITISK |
+| 2 | Memory cap på captures (max 20) | `uart_sniffer.py` | ADVARSEL |
+| 3 | XSS-escaping på sniffer labels | `http_server.py` | ADVARSEL |
+| 4 | Ordentlig URL-decoding (%XX sekvenser) | `http_server.py` | BEMÆRKNING |
+| 5 | Content-Length beregnet på bytes, ikke tegn | `http_server.py` | BEMÆRKNING |
+| 6 | HTTP Basic Auth tilføjet | `http_server.py` | KRITISK |
+| 7 | WiFi auto-reconnect (hvert ~60s) | `main.py` | ADVARSEL |
+| 8 | Watchdog timer (60s timeout) | `main.py` | ADVARSEL |
+| 9 | MQTT heartbeat (hvert ~120s) | `main.py` | ADVARSEL |
+| 10 | MQTT last will ("offline" ved disconnect) | `mqtt_client.py` | ADVARSEL |
+| 11 | Rate limiting på heater toggle (min 10s) | `heater_service.py` | ADVARSEL |
+
+**3. Bevidst IKKE rettet (kræver hardware eller design-beslutninger)**
+
+- 4.8V spændingsbeskyttelse → kræver optocoupler (hardware)
+- MQTT certifikatverifikation → kræver cert deployment
+- WebREPL svagt password → skal ændres manuelt på enhed
+- HeaterService er stub → venter på UART-protokol
+
+Problem / Spørgsmål
+
+1. `tx=-1` i MicroPython UART - er dette supported på alle ESP32 builds? Skal verificeres ved næste deployment.
+2. HTTP Basic Auth sender credentials i klartekst (base64) over HTTP (ikke HTTPS). Acceptabelt for lokalt netværk, men ikke sikkert over internet.
+3. Watchdog på 60 sekunder: Er det for kort hvis en UART capture tager 5 sekunder + HTTP response tid?
+
+Hypotese / Analyse
+
+**Kritiker-agent konceptet:**
+Idéen om en dedikeret AI-agent der KUN finder problemer (aldrig løsninger) viste sig effektiv. Den fandt issues som:
+- TX-pin der aktivt drev COM-linjen (forklarer hardware-problemer på båden)
+- XSS-sårbarhed via sniffer labels
+- Manglende WiFi reconnect (ville have givet problemer i drift)
+
+Konceptet med at separere "builder" og "critic" rollerne tvinger en mere ærlig evaluering.
+
+**Rate limiting design:**
+10 sekunders minimum mellem on/off toggles er konservativt men sikkert for en dieselvarmer. Hurtig toggling kan skade brænder, glødestift og pumpe.
+
+Beslutning
+
+• Alle software-rettelser implementeres nu
+• Hardware-rettelser (optocoupler) venter til næste fysiske session
+• Kritiker-agent gemmes som værktøj til fremtidige reviews
+• GitHub opdateres med alt
+
+Resultat
+
+**Opnået:**
+- ✅ Kritiker-agent prototype (`critic.md`, `run_critic.py`)
+- ✅ 11 rettelser implementeret (2 kritiske, 7 advarsler, 2 bemærkninger)
+- ✅ Alle filer parser korrekt (syntax-verificeret)
+- ✅ GitHub repository sat op og synkroniseret
+
+**Kodeændringer:**
+1. `uart_sniffer.py` - TX pin fjernet, memory cap tilføjet
+2. `http_server.py` - Auth, XSS-escaping, URL-decoding, Content-Length fix
+3. `main.py` - Watchdog, WiFi reconnect, MQTT heartbeat
+4. `heater_service.py` - Rate limiting med 10s interval
+5. `mqtt_client.py` - Last will message
+6. `config_example.py` - HTTP auth credentials tilføjet
+
+**Nye filer:**
+7. `critic.md` - Kritiker-agent prompt-definition
+8. `run_critic.py` - Script til at generere kritisk review
+
+Konsekvens / Læring
+
+1. **Separat kritiker-rolle er værdifuld**: At have en dedikeret "find kun problemer"-agent afdækker blinde punkter som builder-rollen overser.
+2. **TX-pin problemet var nøglen**: Kritikeren identificerede at GPIO17 (TX) stadig blev allokeret i snifferen. Dette kan have bidraget til hardware-problemerne på båden, da UART TX aktivt driver linjen.
+3. **Prototype ≠ produktionskode**: Selvom projektet er en prototype, skal sikkerhedsfundamentet (auth, XSS, rate limiting) være på plads fra starten - det er svært at tilføje retrospektivt.
+4. **Watchdog er essentiel for unattended drift**: En ESP32 der hænger på en båd uden mulighed for manuelt reboot er uacceptabel.
+
+Kode / Output / Referencer
+
+**Kritiker-agent output (sammenfatning):**
+```
+| Prioritet   | Antal |
+|-------------|-------|
+| KRITISK     | 7     |
+| ADVARSEL    | 13    |
+| BEMÆRKNING  | 8     |
+```
+
+**Næste skridt:**
+1. Deploy opdateret kode til ESP32
+2. Verificer `tx=-1` virker i MicroPython v1.27.0
+3. Tilføj HTTP_USER/HTTP_PASSWORD til config.py på ESP32
+4. Test watchdog under normal drift
+5. Medbring optocoupler til næste fysisk session

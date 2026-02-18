@@ -11,6 +11,38 @@ Provides endpoints for:
 """
 
 from uart_sniffer import sniffer  # Development tool, kept as global
+import ubinascii
+
+try:
+    from config import HTTP_USER, HTTP_PASSWORD
+except ImportError:
+    HTTP_USER = None
+    HTTP_PASSWORD = None
+
+
+def _html_escape(s):
+    """Escape HTML special characters to prevent XSS."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&#x27;"))
+
+
+def _url_decode(s):
+    """Decode URL-encoded string (handles %XX sequences and +)."""
+    s = s.replace("+", " ")
+    parts = s.split("%")
+    result = parts[0]
+    for part in parts[1:]:
+        if len(part) >= 2:
+            try:
+                result += chr(int(part[:2], 16)) + part[2:]
+            except ValueError:
+                result += "%" + part
+        else:
+            result += "%" + part
+    return result
 
 
 class HttpServer:
@@ -25,6 +57,12 @@ class HttpServer:
     def __init__(self, heater):
         """Initialize with heater service dependency."""
         self.heater = heater
+        if HTTP_USER and HTTP_PASSWORD:
+            self._auth_token = ubinascii.b2a_base64(
+                "{}:{}".format(HTTP_USER, HTTP_PASSWORD).encode()
+            ).decode().strip()
+        else:
+            self._auth_token = None
 
     def handle_client(self, client):
         """Handle incoming HTTP request."""
@@ -58,7 +96,25 @@ class HttpServer:
             method = parts[0]
             path = parts[1]
 
-            # 4. Extract query string if present
+            # 4. Check authentication
+            if self._auth_token:
+                auth_ok = False
+                for line in lines[1:]:
+                    if line.lower().startswith("authorization: basic "):
+                        token = line.split(" ", 2)[2].strip()
+                        if token == self._auth_token:
+                            auth_ok = True
+                        break
+                if not auth_ok:
+                    client.send(
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "WWW-Authenticate: Basic realm=\"Heater\"\r\n"
+                        "Content-Length: 12\r\n\r\n"
+                        "Unauthorized"
+                    )
+                    return
+
+            # 5. Extract query string if present
             query = ""
             if "?" in path:
                 path, query = path.split("?", 1)
@@ -115,14 +171,15 @@ class HttpServer:
 
     def _send_response(self, client, status_code, status_text, body, content_type="text/plain"):
         """Send HTTP response."""
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
         response = (
             "HTTP/1.1 {} {}\r\n"
             "Content-Type: {}\r\n"
             "Content-Length: {}\r\n"
             "Connection: close\r\n\r\n"
-        ).format(status_code, status_text, content_type, len(body))
+        ).format(status_code, status_text, content_type, len(body_bytes))
         client.send(response)
-        client.send(body)
+        client.send(body_bytes)
 
     def _send_html(self, client, body):
         """Send HTML response."""
@@ -147,15 +204,19 @@ class HttpServer:
 
     def _turn_on(self, client):
         """Turn heater on."""
-        self.heater.turn_on()
-        body = "Heater turned ON"
-        self._send_response(client, 200, "OK", body)
+        if self.heater.turn_on():
+            self._send_response(client, 200, "OK", "Heater turned ON")
+        else:
+            self._send_response(client, 429, "Too Many Requests",
+                                "Rate limited - wait before toggling again")
 
     def _turn_off(self, client):
         """Turn heater off."""
-        self.heater.turn_off()
-        body = "Heater turned OFF"
-        self._send_response(client, 200, "OK", body)
+        if self.heater.turn_off():
+            self._send_response(client, 200, "OK", "Heater turned OFF")
+        else:
+            self._send_response(client, 429, "Too Many Requests",
+                                "Rate limited - wait before toggling again")
 
     def _not_found(self, client):
         """Return 404."""
@@ -180,7 +241,7 @@ class HttpServer:
                     <td style="font-family:monospace;font-size:12px">{}</td>
                     <td><a href="/sniffer/delete?i={}">Slet</a></td>
                 </tr>
-                """.format(i + 1, cap["label"], cap["bytes"], hex_data, i)
+                """.format(i + 1, _html_escape(cap["label"]), cap["bytes"], hex_data, i)
         else:
             captures_html = '<tr><td colspan="5">Ingen captures endnu</td></tr>'
 
@@ -265,10 +326,7 @@ class HttpServer:
         if query:
             for param in query.split("&"):
                 if param.startswith("label="):
-                    label = param[6:]
-                    # URL decode basic characters
-                    label = label.replace("+", " ")
-                    label = label.replace("%20", " ")
+                    label = _url_decode(param[6:])
                     break
 
         # Do the capture (blocks for 5 seconds)
@@ -310,7 +368,7 @@ class HttpServer:
     </div>
 </body>
 </html>""".format(
-            label=label,
+            label=_html_escape(label),
             bytes=result["bytes"],
             hex=hex_data,
             ascii=ascii_data

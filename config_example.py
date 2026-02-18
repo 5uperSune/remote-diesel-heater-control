@@ -32,3 +32,8 @@ MQTT_TOPIC_PREFIX = "heater1"
 # Fallback AP when WiFi connection fails
 AP_SSID = "ESP32-Heater"
 AP_PASSWORD = "heater1234"  # Min 8 characters
+
+# ============ HTTP Authentication ============
+# Basic auth for the web interface (base64 of "user:password")
+HTTP_USER = "admin"
+HTTP_PASSWORD = "changeme"

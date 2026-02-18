@@ -16,6 +16,7 @@ Dual-mode operation:
 """
 
 import time
+from machine import WDT
 from heater_service import HeaterService
 from wifi_sta import connect_wifi, is_connected
 from wifi_ap import start_ap
@@ -76,11 +77,15 @@ def main():
         print("WiFi HTTP:  http://{}/".format(ip))
     print("=" * 40 + "\n")
 
+    # Start watchdog timer (60 seconds - must feed regularly or ESP32 reboots)
+    wdt = WDT(timeout=60000)
+    print("Watchdog: Enabled (60s timeout)")
+
     # Run combined HTTP + MQTT loop
-    run_server_loop(heater, mqtt)
+    run_server_loop(heater, mqtt, wdt)
 
 
-def run_server_loop(heater, mqtt):
+def run_server_loop(heater, mqtt, wdt=None):
     """
     Main server loop handling both HTTP and MQTT.
 
@@ -102,8 +107,14 @@ def run_server_loop(heater, mqtt):
     print("HTTP server listening on port 80")
 
     mqtt_reconnect_timer = 0
+    wifi_check_timer = 0
+    heartbeat_timer = 0
 
     while True:
+        # Feed watchdog - proves main loop is alive
+        if wdt:
+            wdt.feed()
+
         # HTTP request handling
         try:
             client, client_addr = s.accept()
@@ -114,18 +125,33 @@ def run_server_loop(heater, mqtt):
             pass
         except Exception as e:
             print("HTTP: Unexpected error -", e)
-            # Continue loop, don't crash
 
-        # MQTT message handling
+        # WiFi reconnect check (every ~60 seconds)
+        wifi_check_timer += 1
+        if wifi_check_timer > 60:
+            wifi_check_timer = 0
+            if not is_connected():
+                print("WiFi: Connection lost, reconnecting...")
+                try:
+                    connect_wifi(timeout=10)
+                except Exception as e:
+                    print("WiFi: Reconnect failed -", e)
+
+        # MQTT message handling and heartbeat
         try:
             if mqtt and mqtt.connected:
                 mqtt.check_messages()
+                # Publish heartbeat every ~120 seconds
+                heartbeat_timer += 1
+                if heartbeat_timer > 120:
+                    heartbeat_timer = 0
+                    mqtt.publish_status()
             elif mqtt and not mqtt.connected:
-                # Try to reconnect every 30 seconds
                 mqtt_reconnect_timer += 1
                 if mqtt_reconnect_timer > 30:
                     mqtt_reconnect_timer = 0
-                    mqtt.reconnect()
+                    if is_connected():
+                        mqtt.reconnect()
         except Exception as e:
             print("MQTT: Loop error -", e)
             if mqtt:

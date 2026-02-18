@@ -52,6 +52,9 @@ class HeaterMQTT:
                 ssl=ssl_context
             )
 
+            # Set last will so broker publishes "offline" if we disconnect unexpectedly
+            self.client.set_last_will(TOPIC_STATUS, "offline", retain=True)
+
             # Set callback for incoming messages
             self.client.set_callback(self._on_message)
 
