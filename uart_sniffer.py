@@ -53,8 +53,10 @@ class UartSniffer:
         time.sleep_ms(100)
 
         try:
-            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=-1)
-            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=-1)
+            # tx=17 but GPIO17 must be physically disconnected!
+            # tx=-1 is NOT supported on MicroPython v1.27.0
+            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=17)
+            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=17)
         except Exception as e:
             print("UART init error:", e)
             return {"label": label, "data": b"", "baud": self.baud, "bytes": 0}

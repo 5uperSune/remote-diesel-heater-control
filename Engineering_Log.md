@@ -11,6 +11,7 @@ Dato	Emne	Relevans
 04/02 2026	TASK01 Fase 1: Fejlhåndtering og robusthed	Software kvalitet, defensive programming
 04/02 2026	TASK02 Fase 2: Dependency injection	Arkitektur, loose coupling
 15/02 2026	WiFi-konfiguration på båden + Sniffer test	Netværk, hardware debugging
+25/02 2026	Protokol reverse engineering - Level-encoding bekræftet	Protokolanalyse, UART, 250 baud
 
 
 SKABELON:
@@ -2752,3 +2753,118 @@ self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=-1)
 ```
 
 Yderligere beskyttelse planlagt med optocoupler (galvanisk isolation) så ESP32 fysisk ikke kan påvirke COM-linjen.
+
+---
+
+# Engineering Log – 2026-02-25
+
+## Titel: Protokol reverse engineering - Level-encoding bekræftet
+
+## Kontekst
+Arbejde på båden. ESP32 forbundet direkte til COM-linjen (uden optocoupler). Ødelagt remote i brug (fungerer kortvarigt). Ny bestilt remote var inkompatibel (E07 fejl).
+
+## Mål for sessionen
+- Bekræfte baud rate og frame-format fra tidligere session
+- Afklare om temperatur-encoding er absolut (level X) eller relativ (gå op/ned)
+- Mappe alle 7 temperature levels
+
+## Setup / Forudsætninger
+- ESP32 SparkFun IoT RedBoard, MicroPython v1.27.0
+- GPIO16 (RX) med intern pull-up til COM-linje
+- GPIO17 (TX) fysisk afbrudt (ALDRIG forbindes til COM!)
+- Baud rate: 250 baud (bekræftet fra tidligere session)
+- mpremote via COM3 til scripting
+
+## Observationer
+
+### Fix: `tx=-1` virker IKKE på MicroPython v1.27.0
+Opdagelse fra tidligere session bekræftet. `tx=-1` giver `ValueError: invalid pin`.
+Rettet i uart_sniffer.py til `tx=17` med kommentar om at GPIO17 skal være fysisk afbrudt.
+
+### Test 1: Up-Down-Up-Down (absolut vs. relativ)
+**Resultat: ABSOLUT encoding bekræftet!**
+
+Capturen viste at `92` ALTID returneres ved temp ned, og `B2` ALTID ved temp op fra level 1:
+```
+92 (ned) → B2 (op) → 92 (ned) → B2 (op) → 92 (ned) → B2 (op) → 92 (ned)
+```
+Remoten sender "sæt til level X", IKKE "gå én op/ned".
+
+### Test 2: Hurtig 7x OP fra level 1
+Alle levels skiftede indenfor 8 sekunder (1 per sekund):
+```
+F001: 96  (Level 2)
+F002: B6  (Level 3)
+F003: 36  (Level 4?)
+F004: C9  (Level 5)
+F005: 09  (Level 6?)
+F006: D9  (Level 7)
+F007: 19  (Level 8??)
+F008: CB  (overgang?)
+F009: 92  (Level 1 - wrappet rundt)
+```
+
+### Test 3: Langsom 7x OP (4 sek mellem tryk)
+Tydeligere data med response frames synlige:
+```
+Level 1: 92  (idle/base)
+Level 2: 96  (tryk 1)
+Level 3: B6  (tryk 2)
+Level 4: C9  (tryk 3)
+Level 5: D9  (tryk 4)
+-- Remote døde ved tryk 5 (~34 sek) --
+```
+
+### To afsendere på COM-bussen identificeret
+
+| Frame type | Byte 3-7 | Afsender |
+|-----------|----------|----------|
+| DATA frame | `B6 80 CB 4B 49` | Controller → Remote (hvert sekund) |
+| RESP frame | `B2 00 B6 5B 96` | Remote → Controller (heartbeat ~8 sek) |
+| CMD frame  | `96 80 CB 4B 49` | Controller efter knaptryk (byte 3=96 i stedet for B6) |
+
+### Komplet frame-format
+```
+Byte:  1    2    3    4    5    6    7    8
+       80   59   CMD  80   CB   4B   49   LEVEL
+
+CMD: B6 = idle/repeat, 96 = ny kommando (lige efter knaptryk)
+LEVEL: temperatur-encoding (absolut)
+```
+
+### Response frame format (remote → controller)
+```
+Byte:  1    2    3    4    5    6    7    8
+       80   59   B2   00   B6   5B   96   LEVEL
+```
+Indeholder samme LEVEL-byte som bekræftelse.
+
+## Bekræftede temperature levels
+
+| Level | Byte 8 | Status |
+|-------|--------|--------|
+| 1 (lavest) | `92` | Bekræftet |
+| 2 | `96` | Bekræftet |
+| 3 | `B6` | Bekræftet |
+| 4 | `C9` | Bekræftet |
+| 5 (højest?) | `D9` | Bekræftet |
+| 6? | `09` eller `36` | Ubekræftet (kun set i hurtig capture) |
+| 7? | `19` eller `CB` | Ubekræftet (kun set i hurtig capture) |
+
+Brugerens beskrivelse: "Det er et loop 1,2,3,4,5,6,temp, og så 1 igen" - 7 trin total.
+De sidste 2 levels kunne ikke bekræftes da den ødelagte remote døde under capture.
+
+## Problemer
+
+### Ødelagt remote dør efter 5-10 minutter
+Den ødelagte remote (skadet af TX-pin i tidligere session) fungerer kortvarigt men mister kontakt.
+COM-bussen viser korrupte frames (`80 5B 16 96 49 92 92 FB`) lige før den dør.
+
+### Ny replacement remote inkompatibel
+Bestilt ny remote gav E07 fejlkode (COM fejl). Sandsynligvis forkert model/protokolversion.
+
+## Status og næste skridt
+- 5 ud af 7 levels bekræftet med absolut encoding
+- Behøver fungerende remote for at mappe level 6 og 7
+- Næste: Capture ON/OFF kommandoer
+- Næste: Bygge replay-funktion til at sende kommandoer via ESP32
