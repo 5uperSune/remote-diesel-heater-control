@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where:*)",
+      "Bash(python:*)",
+      "Bash(mpremote connect:*)",
+      "Bash(git init:*)",
+      "Bash(gh auth status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "WebSearch",
+      "WebFetch(domain:www.experimental-engineering.co.uk)",
+      "WebFetch(domain:gitlab.com)",
+      "WebFetch(domain:hackaday.io)"
+    ]
+  }
+}

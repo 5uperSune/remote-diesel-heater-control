@@ -1,0 +1,1239 @@
+Du er en erfaren, kritisk ingeniør-reviewer. Find ALLE problemer, risici og mangler.
+
+Vær specifik. Vær direkte. Ingen pæne ord.
+
+Prioriter: 🔴 KRITISK > 🟡 ADVARSEL > 🔵 BEMÆRKNING
+
+Kategorier:
+1. HARDWARE & ELEKTRICITET
+2. SIKKERHED
+3. PÅLIDELIGHED & FEJLHÅNDTERING
+4. ARKITEKTUR & KODE
+5. DRIFT & VEDLIGEHOLD
+
+For hver finding:
+- Hvad er problemet (specifikt, med filnavn og linje hvis relevant)
+- Hvorfor er det et problem
+- Hvor alvorligt er det
+
+Foreslå IKKE løsninger. Kun problemer.
+
+---
+
+============================================================
+PROJEKT TIL KRITISK REVIEW
+ESP32 Diesel Heater Control Gateway
+============================================================
+
+## KILDEKODE
+
+### main.py
+```python
+"""
+main.py
+
+Application entry point and system orchestrator for the ESP32 heater controller.
+
+Startup sequence:
+1. Initialize heater service (with LED indicators)
+2. Connect to WiFi (STA mode) for internet access
+3. Start AP mode as fallback for local access
+4. Connect to MQTT broker for remote control
+5. Start HTTP server for local web interface
+
+Dual-mode operation:
+- Local control via HTTP (AP or STA network)
+- Remote control via MQTT (from anywhere in the world)
+"""
+
+import time
+from machine import WDT
+from heater_service import HeaterService
+from wifi_sta import connect_wifi, is_connected
+from wifi_ap import start_ap
+from mqtt_client import HeaterMQTT
+from http_server import HttpServer
+
+
+def main():
+    print("=" * 40)
+    print("ESP32 Heater Controller")
+    print("=" * 40)
+
+    # 1. Initialize heater service
+    print("\n[1/4] Initializing heater service...")
+    try:
+        heater = HeaterService()
+    except Exception as e:
+        print("FATAL: HeaterService init failed -", e)
+        return  # Cannot continue without heater
+
+    # 2. Connect to WiFi (STA mode)
+    print("\n[2/4] Connecting to WiFi...")
+    wifi_ok = False
+    ip = None
+    try:
+        wifi_ok, ip = connect_wifi(timeout=20)
+    except Exception as e:
+        print("WiFi: Connection error -", e)
+        wifi_ok = False
+
+    # 3. Start AP mode as fallback
+    print("\n[3/4] Starting AP fallback...")
+    try:
+        start_ap()
+    except Exception as e:
+        print("AP: Failed to start -", e)
+        # Continue anyway - WiFi might work
+
+    # 4. Connect to MQTT (if WiFi connected)
+    mqtt = None
+    if wifi_ok:
+        print("\n[4/4] Connecting to MQTT broker...")
+        try:
+            mqtt = HeaterMQTT(heater)
+            if not mqtt.connect():
+                print("MQTT: Will retry later...")
+        except Exception as e:
+            print("MQTT: Init error -", e)
+            mqtt = None
+    else:
+        print("\n[4/4] Skipping MQTT (no WiFi)")
+
+    # 5. Start main loop with HTTP server and MQTT
+    print("\n" + "=" * 40)
+    print("System ready!")
+    print("Local HTTP: http://192.168.4.1/")
+    if wifi_ok:
+        print("WiFi HTTP:  http://{}/".format(ip))
+    print("=" * 40 + "\n")
+
+    # Start watchdog timer (60 seconds - must feed regularly or ESP32 reboots)
+    wdt = WDT(timeout=60000)
+    print("Watchdog: Enabled (60s timeout)")
+
+    # Run combined HTTP + MQTT loop
+    run_server_loop(heater, mqtt, wdt)
+
+
+def run_server_loop(heater, mqtt, wdt=None):
+    """
+    Main server loop handling both HTTP and MQTT.
+
+    Uses socket timeout to allow checking MQTT messages
+    between HTTP requests.
+    """
+    import socket
+
+    # Create HTTP server with dependency injection
+    http = HttpServer(heater)
+
+    addr = ("0.0.0.0", 80)
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(addr)
+    s.listen(1)
+    s.settimeout(1.0)  # 1 second timeout for non-blocking
+
+    print("HTTP server listening on port 80")
+
+    mqtt_reconnect_timer = 0
+    wifi_check_timer = 0
+    heartbeat_timer = 0
+
+    while True:
+        # Feed watchdog - proves main loop is alive
+        if wdt:
+            wdt.feed()
+
+        # HTTP request handling
+        try:
+            client, client_addr = s.accept()
+            print("HTTP client:", client_addr)
+            http.handle_client(client)
+        except OSError:
+            # Timeout - normal operation, no request received
+            pass
+        except Exception as e:
+            print("HTTP: Unexpected error -", e)
+
+        # WiFi reconnect check (every ~60 seconds)
+        wifi_check_timer += 1
+        if wifi_check_timer > 60:
+            wifi_check_timer = 0
+            if not is_connected():
+                print("WiFi: Connection lost, reconnecting...")
+                try:
+                    connect_wifi(timeout=10)
+                except Exception as e:
+                    print("WiFi: Reconnect failed -", e)
+
+        # MQTT message handling and heartbeat
+        try:
+            if mqtt and mqtt.connected:
+                mqtt.check_messages()
+                # Publish heartbeat every ~120 seconds
+                heartbeat_timer += 1
+                if heartbeat_timer > 120:
+                    heartbeat_timer = 0
+                    mqtt.publish_status()
+            elif mqtt and not mqtt.connected:
+                mqtt_reconnect_timer += 1
+                if mqtt_reconnect_timer > 30:
+                    mqtt_reconnect_timer = 0
+                    if is_connected():
+                        mqtt.reconnect()
+        except Exception as e:
+            print("MQTT: Loop error -", e)
+            if mqtt:
+                mqtt.connected = False
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+### heater_service.py
+```python
+# heater_service.py
+"""
+Central service layer for heater control.
+
+Manages heater state and will later handle UART communication
+with the actual heater controller.
+
+LED indicators:
+- Green LED (GPIO18): Lit when heater is ON
+- Red LED (GPIO19): Lit when heater is OFF
+"""
+
+from machine import Pin
+import time
+
+# GPIO pin configuration
+PIN_LED_GREEN = 18  # ON indicator
+PIN_LED_RED = 19    # OFF indicator
+
+# Minimum seconds between state changes (protects heater hardware)
+MIN_TOGGLE_INTERVAL = 10
+
+
+class HeaterService:
+    def __init__(self):
+        self._is_on = False
+        self._last_toggle = 0
+
+        # Initialize LED pins as outputs
+        self._led_green = Pin(PIN_LED_GREEN, Pin.OUT)
+        self._led_red = Pin(PIN_LED_RED, Pin.OUT)
+
+        # Set initial state: heater is OFF, so red LED on
+        self._led_green.off()
+        self._led_red.on()
+
+    def _rate_limit_ok(self):
+        """Check if enough time has passed since last toggle."""
+        now = time.time()
+        if now - self._last_toggle < MIN_TOGGLE_INTERVAL:
+            print("Heater: Rate limited (wait {}s)".format(
+                MIN_TOGGLE_INTERVAL - (now - self._last_toggle)))
+            return False
+        self._last_toggle = now
+        return True
+
+    def turn_on(self):
+        if self._is_on:
+            return True
+        if not self._rate_limit_ok():
+            return False
+        self._is_on = True
+        self._led_green.on()
+        self._led_red.off()
+        print("Heater: ON")
+        return True
+
+    def turn_off(self):
+        if not self._is_on:
+            return True
+        if not self._rate_limit_ok():
+            return False
+        self._is_on = False
+        self._led_green.off()
+        self._led_red.on()
+        print("Heater: OFF")
+        return True
+
+    def is_on(self):
+        return self._is_on
+
+    def status(self):
+        return "ON" if self._is_on else "OFF"
+
+```
+
+### http_server.py
+```python
+# http_server.py
+"""
+HTTP server for local heater control and UART sniffer interface.
+
+Uses dependency injection for HeaterService (clean architecture).
+Sniffer remains as global tool (development utility, not production code).
+
+Provides endpoints for:
+- Heater control: /status, /on, /off
+- UART sniffer: /sniffer, /sniffer/capture, /sniffer/data, /sniffer/clear
+"""
+
+from uart_sniffer import sniffer  # Development tool, kept as global
+import ubinascii
+
+try:
+    from config import HTTP_USER, HTTP_PASSWORD
+except ImportError:
+    HTTP_USER = None
+    HTTP_PASSWORD = None
+
+
+def _html_escape(s):
+    """Escape HTML special characters to prevent XSS."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&#x27;"))
+
+
+def _url_decode(s):
+    """Decode URL-encoded string (handles %XX sequences and +)."""
+    s = s.replace("+", " ")
+    parts = s.split("%")
+    result = parts[0]
+    for part in parts[1:]:
+        if len(part) >= 2:
+            try:
+                result += chr(int(part[:2], 16)) + part[2:]
+            except ValueError:
+                result += "%" + part
+        else:
+            result += "%" + part
+    return result
+
+
+class HttpServer:
+    """
+    HTTP server with explicit HeaterService dependency.
+
+    Usage:
+        server = HttpServer(heater_service)
+        server.handle_client(client_socket)
+    """
+
+    def __init__(self, heater):
+        """Initialize with heater service dependency."""
+        self.heater = heater
+        if HTTP_USER and HTTP_PASSWORD:
+            self._auth_token = ubinascii.b2a_base64(
+                "{}:{}".format(HTTP_USER, HTTP_PASSWORD).encode()
+            ).decode().strip()
+        else:
+            self._auth_token = None
+
+    def handle_client(self, client):
+        """Handle incoming HTTP request."""
+        try:
+            # 1. Receive raw data
+            raw_request = client.recv(1024)
+            if not raw_request:
+                return
+
+            # 2. Decode with error handling
+            try:
+                request = raw_request.decode('utf-8')
+            except UnicodeDecodeError:
+                print("HTTP: Invalid UTF-8 encoding")
+                self._send_response(client, 400, "Bad Request", "Invalid encoding")
+                return
+
+            # 3. Parse request line safely
+            lines = request.split("\r\n")
+            if not lines or not lines[0]:
+                print("HTTP: Empty request")
+                self._send_response(client, 400, "Bad Request", "Empty request")
+                return
+
+            parts = lines[0].split()
+            if len(parts) < 2:
+                print("HTTP: Malformed request line")
+                self._send_response(client, 400, "Bad Request", "Malformed request")
+                return
+
+            method = parts[0]
+            path = parts[1]
+
+            # 4. Check authentication
+            if self._auth_token:
+                auth_ok = False
+                for line in lines[1:]:
+                    if line.lower().startswith("authorization: basic "):
+                        token = line.split(" ", 2)[2].strip()
+                        if token == self._auth_token:
+                            auth_ok = True
+                        break
+                if not auth_ok:
+                    client.send(
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "WWW-Authenticate: Basic realm=\"Heater\"\r\n"
+                        "Content-Length: 12\r\n\r\n"
+                        "Unauthorized"
+                    )
+                    return
+
+            # 5. Extract query string if present
+            query = ""
+            if "?" in path:
+                path, query = path.split("?", 1)
+
+            print("HTTP:", method, path)
+
+            # 5. Route request with exception handling
+            try:
+                self._route_request(client, path, query)
+            except Exception as e:
+                print("HTTP: Handler error -", e)
+                try:
+                    self._send_response(client, 500, "Internal Server Error", "Server error")
+                except:
+                    pass  # Client may have disconnected
+
+        except Exception as e:
+            print("HTTP: Request error -", e)
+
+        finally:
+            try:
+                client.close()
+            except:
+                pass
+
+    def _route_request(self, client, path, query):
+        """Route request to appropriate handler."""
+        # Heater endpoints
+        if path == "/":
+            self._index(client)
+        elif path == "/status":
+            self._status(client)
+        elif path == "/on":
+            self._turn_on(client)
+        elif path == "/off":
+            self._turn_off(client)
+        # Sniffer endpoints (tool - uses global sniffer)
+        elif path == "/sniffer":
+            self._sniffer_page(client)
+        elif path == "/sniffer/capture":
+            self._sniffer_capture(client, query)
+        elif path == "/sniffer/data":
+            self._sniffer_data(client)
+        elif path == "/sniffer/clear":
+            self._sniffer_clear(client)
+        elif path == "/sniffer/delete":
+            self._sniffer_delete(client, query)
+        elif path == "/sniffer/baud":
+            self._sniffer_set_baud(client, query)
+        else:
+            self._not_found(client)
+
+    # ============ Response helpers ============
+
+    def _send_response(self, client, status_code, status_text, body, content_type="text/plain"):
+        """Send HTTP response."""
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        response = (
+            "HTTP/1.1 {} {}\r\n"
+            "Content-Type: {}\r\n"
+            "Content-Length: {}\r\n"
+            "Connection: close\r\n\r\n"
+        ).format(status_code, status_text, content_type, len(body_bytes))
+        client.send(response)
+        client.send(body_bytes)
+
+    def _send_html(self, client, body):
+        """Send HTML response."""
+        self._send_response(client, 200, "OK", body, "text/html; charset=utf-8")
+
+    def _redirect(self, client, location):
+        """Send redirect response."""
+        response = "HTTP/1.1 302 Found\r\nLocation: {}\r\n\r\n".format(location)
+        client.send(response)
+
+    # ============ Heater endpoints ============
+
+    def _index(self, client):
+        """Show available endpoints."""
+        body = "ESP32 Heater Controller\n\nEndpoints:\n  /status\n  /on\n  /off\n  /sniffer"
+        self._send_response(client, 200, "OK", body)
+
+    def _status(self, client):
+        """Return heater status."""
+        body = "Heater status: " + self.heater.status()
+        self._send_response(client, 200, "OK", body)
+
+    def _turn_on(self, client):
+        """Turn heater on."""
+        if self.heater.turn_on():
+            self._send_response(client, 200, "OK", "Heater turned ON")
+        else:
+            self._send_response(client, 429, "Too Many Requests",
+                                "Rate limited - wait before toggling again")
+
+    def _turn_off(self, client):
+        """Turn heater off."""
+        if self.heater.turn_off():
+            self._send_response(client, 200, "OK", "Heater turned OFF")
+        else:
+            self._send_response(client, 429, "Too Many Requests",
+                                "Rate limited - wait before toggling again")
+
+    def _not_found(self, client):
+        """Return 404."""
+        self._send_response(client, 404, "Not Found", "404 Not Found")
+
+    # ============ Sniffer endpoints (development tool) ============
+
+    def _sniffer_page(self, client):
+        """Main sniffer page with input form."""
+        captures = sniffer.get_all_captures()
+
+        # Build captures table
+        captures_html = ""
+        if captures:
+            for i, cap in enumerate(captures):
+                hex_data = sniffer.format_hex(cap["data"]) if cap["data"] else "(ingen data)"
+                captures_html += """
+                <tr>
+                    <td>{}</td>
+                    <td><strong>{}</strong></td>
+                    <td>{} bytes</td>
+                    <td style="font-family:monospace;font-size:12px">{}</td>
+                    <td><a href="/sniffer/delete?i={}">Slet</a></td>
+                </tr>
+                """.format(i + 1, _html_escape(cap["label"]), cap["bytes"], hex_data, i)
+        else:
+            captures_html = '<tr><td colspan="5">Ingen captures endnu</td></tr>'
+
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>UART Sniffer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; }}
+        .form-group {{ margin: 20px 0; padding: 20px; background: #e8f4e8; border-radius: 8px; }}
+        input[type="text"] {{ width: 100%; padding: 15px; font-size: 18px; border: 2px solid #4CAF50; border-radius: 4px; box-sizing: border-box; }}
+        button {{ padding: 15px 30px; font-size: 18px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }}
+        button:hover {{ background: #45a049; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+        th, td {{ padding: 10px; border: 1px solid #ddd; text-align: left; }}
+        th {{ background: #4CAF50; color: white; }}
+        tr:nth-child(even) {{ background: #f9f9f9; }}
+        .info {{ background: #e7f3fe; padding: 15px; border-radius: 4px; margin: 10px 0; }}
+        .actions {{ margin-top: 20px; }}
+        .actions a {{ margin-right: 10px; color: #4CAF50; }}
+        .baud {{ margin: 10px 0; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>UART Sniffer</h1>
+
+        <div class="info">
+            <strong>Baud rate:</strong> {baud}
+            <span class="baud">
+                <a href="/sniffer/baud?b=2400">2400</a> |
+                <a href="/sniffer/baud?b=4800">4800</a> |
+                <a href="/sniffer/baud?b=9600">9600</a> |
+                <a href="/sniffer/baud?b=19200">19200</a> |
+                <a href="/sniffer/baud?b=25000">25000</a>
+            </span>
+        </div>
+
+        <div class="form-group">
+            <form action="/sniffer/capture" method="get">
+                <label for="label"><strong>Hvad vil du capture?</strong></label><br><br>
+                <input type="text" id="label" name="label" placeholder="Skriv kommando her, fx Mountain mode" required>
+                <br>
+                <button type="submit">Capture (5 sek)</button>
+            </form>
+        </div>
+
+        <h2>Captures ({count})</h2>
+        <table>
+            <tr>
+                <th>#</th>
+                <th>Label</th>
+                <th>Size</th>
+                <th>Data (HEX)</th>
+                <th></th>
+            </tr>
+            {captures}
+        </table>
+
+        <div class="actions">
+            <a href="/sniffer">Opdater</a>
+            <a href="/sniffer/clear" onclick="return confirm('Slet alle captures?')">Ryd alle</a>
+            <a href="/">Tilbage til heater</a>
+        </div>
+    </div>
+</body>
+</html>""".format(
+            baud=sniffer.baud,
+            count=len(captures),
+            captures=captures_html
+        )
+
+        self._send_html(client, html)
+
+    def _sniffer_capture(self, client, query):
+        """Capture UART data with given label."""
+        # Parse label from query string
+        label = "Unknown"
+        if query:
+            for param in query.split("&"):
+                if param.startswith("label="):
+                    label = _url_decode(param[6:])
+                    break
+
+        # Do the capture (blocks for 5 seconds)
+        result = sniffer.capture(label)
+
+        # Show result page
+        hex_data = sniffer.format_hex(result["data"]) if result["data"] else "(ingen data)"
+        ascii_data = sniffer.format_ascii(result["data"]) if result["data"] else ""
+
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Capture resultat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
+        .success {{ background: #d4edda; padding: 20px; border-radius: 4px; }}
+        .data {{ background: #f8f9fa; padding: 15px; margin: 10px 0; font-family: monospace; border-radius: 4px; word-break: break-all; }}
+        a {{ color: #4CAF50; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success">
+            <h2>Capture: {label}</h2>
+            <p><strong>Bytes:</strong> {bytes}</p>
+        </div>
+
+        <h3>HEX</h3>
+        <div class="data">{hex}</div>
+
+        <h3>ASCII</h3>
+        <div class="data">{ascii}</div>
+
+        <p>
+            <a href="/sniffer">Tilbage til sniffer</a>
+        </p>
+    </div>
+</body>
+</html>""".format(
+            label=_html_escape(label),
+            bytes=result["bytes"],
+            hex=hex_data,
+            ascii=ascii_data
+        )
+
+        self._send_html(client, html)
+
+    def _sniffer_data(self, client):
+        """Show all captured data as plain text."""
+        captures = sniffer.get_all_captures()
+
+        lines = ["UART SNIFFER DATA", "=" * 40, ""]
+
+        for i, cap in enumerate(captures):
+            lines.append("#{} - {}".format(i + 1, cap["label"]))
+            lines.append("Bytes: {}".format(cap["bytes"]))
+            lines.append("HEX: {}".format(sniffer.format_hex(cap["data"])))
+            lines.append("ASCII: {}".format(sniffer.format_ascii(cap["data"])))
+            lines.append("")
+
+        if not captures:
+            lines.append("Ingen captures endnu.")
+
+        self._send_response(client, 200, "OK", "\n".join(lines))
+
+    def _sniffer_clear(self, client):
+        """Clear all captures."""
+        sniffer.clear_captures()
+        self._redirect(client, "/sniffer")
+
+    def _sniffer_delete(self, client, query):
+        """Delete a specific capture."""
+        index = 0
+        if query:
+            for param in query.split("&"):
+                if param.startswith("i="):
+                    try:
+                        index = int(param[2:])
+                    except:
+                        pass
+                    break
+
+        sniffer.delete_capture(index)
+        self._redirect(client, "/sniffer")
+
+    def _sniffer_set_baud(self, client, query):
+        """Set baud rate."""
+        baud = 9600
+        if query:
+            for param in query.split("&"):
+                if param.startswith("b="):
+                    try:
+                        baud = int(param[2:])
+                    except:
+                        pass
+                    break
+
+        sniffer.set_baud(baud)
+        self._redirect(client, "/sniffer")
+
+```
+
+### mqtt_client.py
+```python
+# mqtt_client.py
+"""
+MQTT Client for remote heater control via HiveMQ Cloud.
+
+Handles:
+- TLS-encrypted connection to HiveMQ
+- Subscribing to command topic
+- Publishing status updates
+- Reconnection on connection loss
+"""
+
+import time
+from umqtt.simple import MQTTClient
+import ssl
+
+from config import (
+    MQTT_BROKER,
+    MQTT_PORT,
+    MQTT_USER,
+    MQTT_PASSWORD,
+    MQTT_TOPIC_PREFIX
+)
+
+# Topics
+TOPIC_COMMAND = MQTT_TOPIC_PREFIX + "/command"
+TOPIC_STATUS = MQTT_TOPIC_PREFIX + "/status"
+
+
+class HeaterMQTT:
+    def __init__(self, heater_service):
+        self.heater = heater_service
+        self.client = None
+        self.connected = False
+
+    def connect(self):
+        """Connect to MQTT broker with TLS."""
+        try:
+            # Create unique client ID
+            import machine
+            client_id = "esp32_heater_" + str(machine.unique_id().hex())
+
+            # SSL context for TLS connection
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.verify_mode = ssl.CERT_NONE  # For simplicity; production should verify
+
+            self.client = MQTTClient(
+                client_id,
+                MQTT_BROKER,
+                port=MQTT_PORT,
+                user=MQTT_USER,
+                password=MQTT_PASSWORD,
+                ssl=ssl_context
+            )
+
+            # Set last will so broker publishes "offline" if we disconnect unexpectedly
+            self.client.set_last_will(TOPIC_STATUS, "offline", retain=True)
+
+            # Set callback for incoming messages
+            self.client.set_callback(self._on_message)
+
+            print("MQTT: Connecting to {}:{}...".format(MQTT_BROKER, MQTT_PORT))
+            self.client.connect()
+            print("MQTT: Connected!")
+
+            # Subscribe to command topic
+            self.client.subscribe(TOPIC_COMMAND)
+            print("MQTT: Subscribed to", TOPIC_COMMAND)
+
+            # Publish online status
+            self.publish_status()
+
+            self.connected = True
+            return True
+
+        except Exception as e:
+            print("MQTT: Connection failed -", e)
+            self.connected = False
+            return False
+
+    def _on_message(self, topic, msg):
+        """Handle incoming MQTT messages."""
+        topic = topic.decode()
+        msg = msg.decode().strip().lower()
+
+        print("MQTT: Received '{}' on '{}'".format(msg, topic))
+
+        if topic == TOPIC_COMMAND:
+            if msg == "on":
+                self.heater.turn_on()
+                self.publish_status()
+            elif msg == "off":
+                self.heater.turn_off()
+                self.publish_status()
+            elif msg == "status":
+                self.publish_status()
+            else:
+                print("MQTT: Unknown command:", msg)
+
+    def publish_status(self):
+        """Publish current heater status."""
+        if self.client and self.connected:
+            status = self.heater.status()
+            self.client.publish(TOPIC_STATUS, status)
+            print("MQTT: Published status:", status)
+
+    def check_messages(self):
+        """
+        Check for new MQTT messages (non-blocking).
+        Call this regularly in main loop.
+        """
+        if self.client and self.connected:
+            try:
+                self.client.check_msg()
+            except Exception as e:
+                print("MQTT: Error checking messages -", e)
+                self.connected = False
+
+    def disconnect(self):
+        """Disconnect from MQTT broker."""
+        if self.client:
+            try:
+                self.client.publish(TOPIC_STATUS, "offline")
+                self.client.disconnect()
+            except:
+                pass
+            self.connected = False
+            print("MQTT: Disconnected")
+
+    def reconnect(self):
+        """Attempt to reconnect to MQTT broker."""
+        print("MQTT: Attempting reconnect...")
+        self.disconnect()
+        time.sleep(2)
+        return self.connect()
+
+```
+
+### uart_sniffer.py
+```python
+# uart_sniffer.py
+"""
+UART Sniffer for reverse-engineering heater remote control protocol.
+
+Captures UART data and associates it with user-defined labels.
+Designed to be used via HTTP interface for easy protocol analysis.
+
+Hardware setup:
+- Connect heater remote TX line to ESP32 GPIO16 (RX)
+- Common GND between ESP32 and heater system
+"""
+
+from machine import UART
+import time
+import gc
+
+# UART2 pin configuration (RX only - never drive the COM line!)
+PIN_RX = 16
+
+# Default settings
+DEFAULT_BAUD = 2400
+CAPTURE_DURATION_MS = 5000  # 5 seconds capture
+MAX_CAPTURES = 20  # Prevent memory exhaustion
+
+
+class UartSniffer:
+    def __init__(self, baud=DEFAULT_BAUD):
+        self.baud = baud
+        self.uart = None
+        self.captured_commands = []
+
+    def _cleanup_uart(self):
+        """Safely cleanup UART."""
+        if self.uart:
+            try:
+                self.uart.deinit()
+            except:
+                pass
+            self.uart = None
+        gc.collect()
+
+    def set_baud(self, baud):
+        """Change baud rate for next capture."""
+        self._cleanup_uart()
+        self.baud = baud
+
+    def capture(self, label, duration_ms=CAPTURE_DURATION_MS):
+        """
+        Capture UART data for a specified duration and label it.
+        """
+        # Cleanup any previous UART
+        self._cleanup_uart()
+        time.sleep_ms(100)
+
+        try:
+            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=-1)
+            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=-1)
+        except Exception as e:
+            print("UART init error:", e)
+            return {"label": label, "data": b"", "baud": self.baud, "bytes": 0}
+
+        # Clear any pending data
+        try:
+            if self.uart.any():
+                self.uart.read()
+        except:
+            pass
+
+        print("Capturing '{}' for {}ms at {} baud...".format(
+            label, duration_ms, self.baud))
+
+        all_data = bytearray()
+        start_time = time.ticks_ms()
+
+        try:
+            while time.ticks_diff(time.ticks_ms(), start_time) < duration_ms:
+                if self.uart.any():
+                    chunk = self.uart.read()
+                    if chunk:
+                        all_data.extend(chunk)
+                time.sleep_ms(5)
+        except Exception as e:
+            print("Capture error:", e)
+        finally:
+            self._cleanup_uart()
+
+        result = {
+            "label": label,
+            "data": bytes(all_data),
+            "baud": self.baud,
+            "bytes": len(all_data)
+        }
+
+        if len(self.captured_commands) >= MAX_CAPTURES:
+            self.captured_commands.pop(0)
+            print("Max captures reached, oldest removed")
+        self.captured_commands.append(result)
+        print("Captured {} bytes for '{}'".format(len(all_data), label))
+
+        gc.collect()
+        return result
+
+    def get_all_captures(self):
+        return self.captured_commands
+
+    def clear_captures(self):
+        self.captured_commands = []
+        gc.collect()
+
+    def delete_capture(self, index):
+        if 0 <= index < len(self.captured_commands):
+            self.captured_commands.pop(index)
+            return True
+        return False
+
+    def format_hex(self, data):
+        return " ".join("{:02X}".format(b) for b in data)
+
+    def format_ascii(self, data):
+        result = ""
+        for b in data:
+            if 32 <= b <= 126:
+                result += chr(b)
+            else:
+                result += "."
+        return result
+
+
+# Global sniffer instance
+sniffer = UartSniffer()
+
+```
+
+### wifi_sta.py
+```python
+# wifi_sta.py
+"""
+WiFi Station mode - connects ESP32 to existing WiFi network.
+
+Imports credentials from config.py for easy configuration.
+"""
+
+import network
+import time
+
+from config import WIFI_SSID, WIFI_PASSWORD
+
+
+def connect_wifi(timeout=20):
+    """
+    Connect to WiFi network.
+
+    Args:
+        timeout: Max seconds to wait for connection
+
+    Returns:
+        tuple: (success: bool, ip: str or None)
+    """
+    sta = network.WLAN(network.STA_IF)
+
+    # Reset WiFi state to avoid "Internal State Error"
+    sta.active(False)
+    time.sleep(0.5)
+    sta.active(True)
+
+    if sta.isconnected():
+        print("WiFi: Already connected")
+        return True, sta.ifconfig()[0]
+
+    print("WiFi: Connecting to '{}'...".format(WIFI_SSID))
+    sta.connect(WIFI_SSID, WIFI_PASSWORD)
+
+    start = time.time()
+    while not sta.isconnected():
+        if time.time() - start > timeout:
+            print("WiFi: Connection timeout!")
+            return False, None
+        time.sleep(0.5)
+        print(".", end="")
+
+    ip = sta.ifconfig()[0]
+    print("\nWiFi: Connected!")
+    print("WiFi: IP address:", ip)
+
+    return True, ip
+
+
+def disconnect_wifi():
+    """Disconnect from WiFi."""
+    sta = network.WLAN(network.STA_IF)
+    sta.disconnect()
+    sta.active(False)
+    print("WiFi: Disconnected")
+
+
+def is_connected():
+    """Check if WiFi is connected."""
+    sta = network.WLAN(network.STA_IF)
+    return sta.isconnected()
+
+
+def get_ip():
+    """Get current IP address or None if not connected."""
+    sta = network.WLAN(network.STA_IF)
+    if sta.isconnected():
+        return sta.ifconfig()[0]
+    return None
+
+```
+
+### wifi_ap.py
+```python
+# wifi_ap.py
+"""
+Wi-Fi Access Point configuration module.
+
+Provides functions to initialize the ESP32 as a Wi-Fi access point
+for local configuration and fallback control.
+
+Credentials loaded from config.py for easy configuration.
+"""
+
+import network
+import time
+
+from config import AP_SSID, AP_PASSWORD
+
+
+def start_ap():
+    """
+    Start the ESP32 in Access Point mode.
+
+    Returns the WLAN object for the AP interface.
+    """
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    ap.config(essid=AP_SSID, password=AP_PASSWORD, authmode=3)
+
+    time.sleep(1)
+    ip = ap.ifconfig()[0]
+    print("AP: Started '{}'".format(AP_SSID))
+    print("AP: IP address:", ip)
+
+    return ap
+
+
+def stop_ap():
+    """Stop the Access Point."""
+    ap = network.WLAN(network.AP_IF)
+    ap.active(False)
+    print("AP: Stopped")
+
+```
+
+### config_example.py
+```python
+# config_example.py
+"""
+Configuration template for ESP32 Heater Controller.
+
+SETUP INSTRUCTIONS:
+1. Copy this file to 'config.py'
+2. Fill in your own credentials below
+3. Upload config.py to ESP32
+
+IMPORTANT: Never commit config.py to git - it contains your passwords!
+"""
+
+# ============ WiFi Settings ============
+# Your home WiFi network credentials
+WIFI_SSID = "YourWiFiName"
+WIFI_PASSWORD = "YourWiFiPassword"
+
+# ============ MQTT Settings ============
+# HiveMQ Cloud credentials (create free account at hivemq.com)
+MQTT_BROKER = "your-cluster.hivemq.cloud"
+MQTT_PORT = 8883  # TLS encrypted port
+MQTT_USER = "your-username"
+MQTT_PASSWORD = "your-mqtt-password"
+
+# MQTT Topics - change 'heater1' to a unique ID for your device
+MQTT_TOPIC_PREFIX = "heater1"
+# This creates topics:
+#   heater1/command  (receive commands: on, off, status)
+#   heater1/status   (publish current status)
+
+# ============ Access Point Settings ============
+# Fallback AP when WiFi connection fails
+AP_SSID = "ESP32-Heater"
+AP_PASSWORD = "heater1234"  # Min 8 characters
+
+# ============ HTTP Authentication ============
+# Basic auth for the web interface (base64 of "user:password")
+HTTP_USER = "admin"
+HTTP_PASSWORD = "changeme"
+
+```
+
+## SENESTE ENGINEERING LOG (uddrag)
+```
+ESP32 builds? Skal verificeres ved næste deployment.
+2. HTTP Basic Auth sender credentials i klartekst (base64) over HTTP (ikke HTTPS). Acceptabelt for lokalt netværk, men ikke sikkert over internet.
+3. Watchdog på 60 sekunder: Er det for kort hvis en UART capture tager 5 sekunder + HTTP response tid?
+
+Hypotese / Analyse
+
+**Kritiker-agent konceptet:**
+Idéen om en dedikeret AI-agent der KUN finder problemer (aldrig løsninger) viste sig effektiv. Den fandt issues som:
+- TX-pin der aktivt drev COM-linjen (forklarer hardware-problemer på båden)
+- XSS-sårbarhed via sniffer labels
+- Manglende WiFi reconnect (ville have givet problemer i drift)
+
+Konceptet med at separere "builder" og "critic" rollerne tvinger en mere ærlig evaluering.
+
+**Rate limiting design:**
+10 sekunders minimum mellem on/off toggles er konservativt men sikkert for en dieselvarmer. Hurtig toggling kan skade brænder, glødestift og pumpe.
+
+Beslutning
+
+• Alle software-rettelser implementeres nu
+• Hardware-rettelser (optocoupler) venter til næste fysiske session
+• Kritiker-agent gemmes som værktøj til fremtidige reviews
+• GitHub opdateres med alt
+
+Resultat
+
+**Opnået:**
+- ✅ Kritiker-agent prototype (`critic.md`, `run_critic.py`)
+- ✅ 11 rettelser implementeret (2 kritiske, 7 advarsler, 2 bemærkninger)
+- ✅ Alle filer parser korrekt (syntax-verificeret)
+- ✅ GitHub repository sat op og synkroniseret
+
+**Kodeændringer:**
+1. `uart_sniffer.py` - TX pin fjernet, memory cap tilføjet
+2. `http_server.py` - Auth, XSS-escaping, URL-decoding, Content-Length fix
+3. `main.py` - Watchdog, WiFi reconnect, MQTT heartbeat
+4. `heater_service.py` - Rate limiting med 10s interval
+5. `mqtt_client.py` - Last will message
+6. `config_example.py` - HTTP auth credentials tilføjet
+
+**Nye filer:**
+7. `critic.md` - Kritiker-agent prompt-definition
+8. `run_critic.py` - Script til at generere kritisk review
+
+Konsekvens / Læring
+
+1. **Separat kritiker-rolle er værdifuld**: At have en dedikeret "find kun problemer"-agent afdækker blinde punkter som builder-rollen overser.
+2. **TX-pin problemet var nøglen**: Kritikeren identificerede at GPIO17 (TX) stadig blev allokeret i snifferen. Dette kan have bidraget til hardware-problemerne på båden, da UART TX aktivt driver linjen.
+3. **Prototype ≠ produktionskode**: Selvom projektet er en prototype, skal sikkerhedsfundamentet (auth, XSS, rate limiting) være på plads fra starten - det er svært at tilføje retrospektivt.
+4. **Watchdog er essentiel for unattended drift**: En ESP32 der hænger på en båd uden mulighed for manuelt reboot er uacceptabel.
+
+Kode / Output / Referencer
+
+**Kritiker-agent output (sammenfatning):**
+```
+| Prioritet   | Antal |
+|-------------|-------|
+| KRITISK     | 7     |
+| ADVARSEL    | 13    |
+| BEMÆRKNING  | 8     |
+```
+
+**Næste skridt:**
+1. Deploy opdateret kode til ESP32
+2. Verificer `tx=-1` virker i MicroPython v1.27.0
+3. Tilføj HTTP_USER/HTTP_PASSWORD til config.py på ESP32
+4. Test watchdog under normal drift
+5. Medbring optocoupler til næste fysisk session
+
+```
+
+## HARDWARE SETUP
+- Board: SparkFun IoT RedBoard ESP32 (ESP32-WROOM-32)
+- MicroPython v1.27.0
+- Varmer: Kinesisk dieselvarmer, single-wire COM bus (4.8V)
+- UART2: GPIO16 (RX), GPIO17 (TX)
+- LEDs: GPIO18 (grøn), GPIO19 (rød)
+- WiFi: STA + AP mode
+- MQTT: HiveMQ Cloud med TLS
+- WebREPL: Port 8266, aktiv
+
+## CREDENTIALS CHECK
+- config.py EKSISTERER lokalt (bør IKKE committes)
+- webrepl_cmd.py EKSISTERER lokalt (bør IKKE committes)
+
+
+---
+
+GIV DIN KRITISKE REVIEW NU:
