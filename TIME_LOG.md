@@ -9,8 +9,9 @@
 | Uge 6 (feb) | 10 | 40 |
 | Uge 7 (feb) | 3 | 43 |
 | Uge 9 (feb) | 4 | 47 |
+| Uge 9 (feb) | 3 | 50 |
 
-**Total estimeret: ~47 timer**
+**Total estimeret: ~50 timer**
 
 ---
 
@@ -92,6 +93,17 @@
 | Engineering Log og dokumentation | 0.5 |
 | **Total** | **4.0** |
 
+### 2026-02-26 (Onsdag)
+| Aktivitet | Timer |
+|-----------|-------|
+| Baud rate verifikation (pulsbredde-måling, multi-baud test) | 0.5 |
+| ON/OFF capture og analyse | 0.5 |
+| Mountain mode komplet level capture (1-6 + thermostat) | 0.5 |
+| Normal mode level capture (1-5) | 0.5 |
+| FF-modifier opdagelse og protokolanalyse | 0.5 |
+| Engineering Log opdatering | 0.5 |
+| **Total** | **3.0** |
+
 ---
 
 ## Kategorier (til rapport)
@@ -130,4 +142,4 @@ Studenten var stadig ansvarlig for:
 
 ---
 
-*Opdateret: 2026-02-04*
+*Opdateret: 2026-02-26*
