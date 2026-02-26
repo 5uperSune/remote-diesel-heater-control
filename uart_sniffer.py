@@ -6,8 +6,12 @@ Captures UART data and associates it with user-defined labels.
 Designed to be used via HTTP interface for easy protocol analysis.
 
 Hardware setup:
-- Connect heater remote TX line to ESP32 GPIO16 (RX)
-- Common GND between ESP32 and heater system
+- COM line → 200Ω resistor → PC817 optocoupler input (V1/GND)
+- PC817 output (N1) → ESP32 GPIO16 (RX), (ND) → ESP32 GND
+- Optocoupler inverts signal, so UART.INV_RX is required
+- GPIO17 (TX) must be physically disconnected - NEVER drive COM line!
+
+Protocol: 250 baud, 8N1, half-duplex single-wire COM bus
 """
 
 from machine import UART
@@ -18,14 +22,15 @@ import gc
 PIN_RX = 16
 
 # Default settings
-DEFAULT_BAUD = 2400
+DEFAULT_BAUD = 250
 CAPTURE_DURATION_MS = 5000  # 5 seconds capture
 MAX_CAPTURES = 20  # Prevent memory exhaustion
 
 
 class UartSniffer:
-    def __init__(self, baud=DEFAULT_BAUD):
+    def __init__(self, baud=DEFAULT_BAUD, invert_rx=True):
         self.baud = baud
+        self.invert_rx = invert_rx
         self.uart = None
         self.captured_commands = []
 
@@ -55,8 +60,9 @@ class UartSniffer:
         try:
             # tx=17 but GPIO17 must be physically disconnected!
             # tx=-1 is NOT supported on MicroPython v1.27.0
-            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=17)
-            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=17)
+            invert = UART.INV_RX if self.invert_rx else 0
+            self.uart = UART(2, baudrate=self.baud, rx=PIN_RX, tx=17, invert=invert)
+            self.uart.init(self.baud, bits=8, parity=None, stop=1, rx=PIN_RX, tx=17, invert=invert)
         except Exception as e:
             print("UART init error:", e)
             return {"label": label, "data": b"", "baud": self.baud, "bytes": 0}
@@ -128,5 +134,5 @@ class UartSniffer:
         return result
 
 
-# Global sniffer instance
+# Global sniffer instance (250 baud, inverted RX for optocoupler)
 sniffer = UartSniffer()

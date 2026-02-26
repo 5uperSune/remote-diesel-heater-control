@@ -275,11 +275,10 @@ class HttpServer:
         <div class="info">
             <strong>Baud rate:</strong> {baud}
             <span class="baud">
+                <a href="/sniffer/baud?b=250"><strong>250</strong></a> |
                 <a href="/sniffer/baud?b=2400">2400</a> |
                 <a href="/sniffer/baud?b=4800">4800</a> |
-                <a href="/sniffer/baud?b=9600">9600</a> |
-                <a href="/sniffer/baud?b=19200">19200</a> |
-                <a href="/sniffer/baud?b=25000">25000</a>
+                <a href="/sniffer/baud?b=9600">9600</a>
             </span>
         </div>
 
