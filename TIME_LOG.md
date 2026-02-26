@@ -8,8 +8,9 @@
 | Uge 5 (jan/feb) | 18 | 30 |
 | Uge 6 (feb) | 10 | 40 |
 | Uge 7 (feb) | 3 | 43 |
+| Uge 9 (feb) | 4 | 47 |
 
-**Total estimeret: ~43 timer**
+**Total estimeret: ~47 timer**
 
 ---
 
@@ -79,6 +80,17 @@
 | UART Sniffer test med fjernbetjening | 1.0 |
 | Debugging af sniffer stabilitetsproblemer | 0.5 |
 | **Total** | **3.0** |
+
+### 2026-02-25 (Tirsdag)
+| Aktivitet | Timer |
+|-----------|-------|
+| Optocoupler test (PC817) og debugging | 1.0 |
+| Direkte forbindelse uden optocoupler | 0.5 |
+| Baud rate discovery (250 baud) | 0.5 |
+| Protokol capture: up/down/absolut test | 1.0 |
+| Protokol capture: level mapping (7 levels) | 0.5 |
+| Engineering Log og dokumentation | 0.5 |
+| **Total** | **4.0** |
 
 ---
 
