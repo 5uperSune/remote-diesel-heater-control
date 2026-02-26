@@ -12,6 +12,7 @@ Dato	Emne	Relevans
 04/02 2026	TASK02 Fase 2: Dependency injection	Arkitektur, loose coupling
 15/02 2026	WiFi-konfiguration på båden + Sniffer test	Netværk, hardware debugging
 25/02 2026	Protokol reverse engineering - Level-encoding bekræftet	Protokolanalyse, UART, 250 baud
+26/02 2026	Protokol gennembrud - Komplet level/mode mapping	Frame-struktur, FF-modifier, ON/OFF, mountain/normal
 
 
 SKABELON:
@@ -2868,3 +2869,148 @@ Bestilt ny remote gav E07 fejlkode (COM fejl). Sandsynligvis forkert model/proto
 - Behøver fungerende remote for at mappe level 6 og 7
 - Næste: Capture ON/OFF kommandoer
 - Næste: Bygge replay-funktion til at sende kommandoer via ESP32
+
+**VIGTIGT: Se log entry 2026-02-26 for korrigerede fund. Frame-formatet i denne entry er delvist forkert pga. den ødelagte remote og manglende forståelse af FF-modifier byten.**
+
+---
+
+# Engineering Log – 2026-02-26
+
+## Titel: Protokol gennembrud - Komplet level/mode mapping
+
+## Kontekst
+Arbejde på båden med fungerende remote (LCDMAX V2 270502, ældre model uden Bluetooth). ESP32 forbundet direkte til COM-linjen via GPIO16 (RX) med intern pull-up. Tidligere sessions fund var delvist forkerte - denne session korrigerer og kompletterer protokolforståelsen.
+
+## Mål for sessionen
+- Bekræfte baud rate (250 baud vs. 25.000 baud fra web-søgning)
+- Fange ON/OFF transition
+- Mappe alle 6 levels i mountain mode OG normal mode
+- Forstå komplet frame-format
+
+## Setup / Forudsætninger
+- ESP32 SparkFun IoT RedBoard, MicroPython v1.27.0
+- GPIO16 (RX) med intern pull-up til COM-linje
+- GPIO17 (TX) fysisk afbrudt
+- Fungerende remote: LCDMAX V2 270502
+- mpremote via COM3
+
+## Observationer
+
+### Baud rate bekræftet: 250 baud er korrekt
+Web-søgning antydede 25.000 baud (standard for nyere kinesiske fyr med Bluetooth). Pulsbredde-måling bekræftede 250 baud:
+- Korteste LOW-puls: 3956 µs ≈ 4000 µs = 250 baud
+- Korteste HIGH-puls: 1066 µs (sub-bit feature, ikke baud-bestemmende)
+- Capture ved 25.000, 4.800 og 11.000 baud gav kun 0x00 bytes
+
+Konklusion: Denne ældre heater-model bruger 250 baud, IKKE 25.000 baud som nyere modeller.
+
+### ON/OFF transition fanget
+Fyret slukket → tændt med 30 sekunders capture:
+
+**OFF-tilstand (7-byte heartbeat):**
+```
+C0 96 0B B6 B2 92 CB
+```
+
+**Tænd-kommando (CMD byte ændres):**
+```
+C0 96 16 B6 B2 96 B2 C0 96 D9 80 59 92 92 CB
+```
+`0B` → `16` = tænd-kommando
+
+**ON-tilstand (15-byte frame):**
+Frame-størrelsen fordobles. Mode-bytes ændrer sig under opstart (`59` → `D9`/`4B`).
+
+### GENNEMBRUD: FF-modifier byten
+Det store problem fra tidligere sessions var at level-ændringer ikke kunne ses. Årsagen: **level-encoding bruger 7 ELLER 8 bytes**, hvor den 8. byte `FF` fungerer som "+1" modifier.
+
+Ulige levels (1, 3, 5) = 7-byte frame (uden FF)
+Lige levels (2, 4, 6) = 8-byte frame (med FF som 8. byte)
+
+Hver level-byte dækker TO levels. Derfor så vi "ingen ændring" ved hvert andet knaptryk - fordi kun FF-byten blev tilføjet/fjernet.
+
+### Mountain mode - Komplet level capture (Level 1→6 + thermostat)
+
+| Level | Frame (heartbeat) | Bytes |
+|-------|-------------------|-------|
+| 1 | `C0 96 0B B6 5B 96 92` | 7 |
+| 2 | `C0 96 0B B6 5B 96 92 FF` | 8 |
+| 3 | `C0 96 0B B6 5B 96 B2` | 7 |
+| 4 | `C0 96 0B B6 5B 96 B2 FF` | 8 |
+| 5 | `C0 96 0B B6 5B 96 96` | 7 |
+| 6 | `C0 96 0B B6 5B 96 96 FF` | 8 |
+| Temp | Mode skifter til `49`, frame: `40 5B 16 96 49 92 B2` | Anderledes |
+
+### Normal mode - Komplet level capture (Level 1→5 fanget)
+
+| Level | Frame (heartbeat) | Bytes |
+|-------|-------------------|-------|
+| 1 | `C0 96 0B B6 4B 96 92` | 7 |
+| 2 | `C0 96 0B B6 4B 96 92 FF` | 8 |
+| 3 | `C0 96 0B B6 4B 96 B2` | 7 |
+| 4 | `C0 96 0B B6 4B 96 B2 FF` | 8 |
+| 5 | `C0 96 0B B6 4B 96 96` | 7 |
+| 6 | `C0 96 0B B6 4B 96 96 FF` | 8 (antaget, ikke fanget) |
+
+Normal og mountain mode bruger **identisk level-encoding**, kun mode-byten (pos 4) er forskellig.
+
+### Mode-skift fanget
+Skift fra mountain → normal genererer kommando-frame med CMD:`5B`:
+```
+Sec 5: C0 96 0B B6 5B 96 92 C0 96 5B 80 CB 49 49 92
+```
+Herefter skifter mode-byte fra `5B` → `4B`.
+
+### Komplet frame-format (korrigeret)
+```
+Position:  0    1    2    3    4    5    6    [7]
+Byte:      C0   96   CMD  B6   MODE 96   LVL  [FF]
+
+CMD:   0B = idle/heartbeat
+       16 = tænd (ON)
+       36 = level-ændring
+       5B = mode-skift (mountain ↔ normal)
+
+MODE:  4B = normal mode
+       5B = mountain mode
+       49 = thermostat mode
+
+LVL:   92 = level 1/2
+       B2 = level 3/4
+       96 = level 5/6
+
+[FF]:  Tilstede = lige level (2, 4, 6)
+       Fraværende = ulige level (1, 3, 5)
+```
+
+### Response frames (controller → remote, efter knaptryk)
+Ved level-ændring ses en response frame efter CMD:36:
+```
+00 59 B6 80 CB 4B 49 [LEVEL_ACK]
+```
+Hvor LEVEL_ACK varierer: B2, B6, D9, CB (mønster endnu ikke fuldt kortlagt).
+
+## Korrektion af tidligere fund
+Loggen fra 2026-02-25 indeholdt delvist forkerte frame-formater:
+- Header var identificeret som `80 59` - dette er faktisk en del af response framen, ikke heartbeat
+- Den korrekte heartbeat header er `C0 96`
+- Level-tabellen var forkert pga. den ødelagte remote og manglende FF-modifier forståelse
+- Baud rate 250 er korrekt (25.000 baud hypotesen blev afkræftet)
+
+## Beslutning
+- Frame-format er nu tilstrækkeligt forstået til at bygge replay-funktion
+- FF-modifier er nøglen til korrekt level-encoding
+- Thermostat-mode kræver yderligere analyse
+
+## Resultat
+- **Komplet level-tabel** for mountain mode (alle 6 levels + thermostat)
+- **Delvis level-tabel** for normal mode (5 af 6 levels)
+- **Frame-format** korrigeret og dokumenteret
+- **ON/OFF kommandoer** fanget
+- **Mode-skift** (mountain ↔ normal) fanget
+
+## Konsekvens / Læring
+1. **FF-modifier mønsteret** var uventet - en variabel frame-længde til at encode ulige/lige levels. Tidligere sessions missede dette fordi vi antog fast frame-størrelse.
+2. **Remoten viser meget telemetri** (temperatur, batteri, fan, pumpe) men disse data er endnu ikke identificeret i frame-bytes.
+3. **Næste skridt**: Bygge TX-funktion til at sende kommandoer fra ESP32 til heater controller.
+4. **Risiko**: TX-funktionen kræver at ESP32 driver COM-linjen. Dette har tidligere ødelagt 2 remotes. Kræver omhyggelig implementering med korrekt timing og line-driving.
